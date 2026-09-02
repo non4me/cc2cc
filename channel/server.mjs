@@ -92,7 +92,10 @@ function decryptText(data) {
 
 // ─── Logging (structured JSON → stderr; stdout is MCP transport) ─────────────
 
+let stdioDead = false; // set once our stdio pipes are gone (parent exited)
+
 function log(level, msg, data = {}) {
+  if (stdioDead) return;
   const entry = {
     ts: new Date().toISOString(),
     level,
@@ -100,7 +103,11 @@ function log(level, msg, data = {}) {
     msg,
     ...data,
   };
-  process.stderr.write(JSON.stringify(entry) + "\n");
+  try {
+    process.stderr.write(JSON.stringify(entry) + "\n");
+  } catch {
+    stdioDead = true;
+  }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1138,11 +1145,45 @@ async function init() {
   }, 3000);
 }
 
+// ─── Parent-Death Detection ─────────────────────────────────────────────────
+// When the Claude Code session that spawned us dies, our stdio sockets close.
+// Without these guards every stdout/stderr write throws EPIPE, the
+// uncaughtException handler tries to log (another EPIPE), and the orphaned
+// process spins at 100% CPU forever.
+
+const PARENT_PID = process.ppid;
+const STDIO_ERROR_CODES = new Set(["EPIPE", "ECONNRESET", "EIO", "EBADF"]);
+
+function onParentGone(reason) {
+  if (stdioDead) return;
+  stdioDead = true;
+  // Hard exit if graceful shutdown hangs (e.g. filesystem stalls).
+  setTimeout(() => process.exit(1), 3000).unref();
+  gracefulShutdown(reason).catch(() => process.exit(1));
+}
+
+for (const stream of [process.stdin, process.stdout, process.stderr]) {
+  stream.on("error", (err) => {
+    if (err && STDIO_ERROR_CODES.has(err.code)) onParentGone(`stdio ${err.code}`);
+  });
+}
+process.stdin.on("end", () => onParentGone("stdin closed"));
+process.stdin.on("close", () => onParentGone("stdin closed"));
+
+// POSIX reparents orphans to pid 1; poll for that as a belt-and-braces check.
+setInterval(() => {
+  if (process.ppid !== PARENT_PID) onParentGone(`parent ${PARENT_PID} exited`);
+}, HEARTBEAT_INTERVAL_MS).unref();
+
 // ─── Global Error Handlers ──────────────────────────────────────────────────
 // Without these, any unhandled error silently kills the Node.js process,
 // dropping the MCP connection with no trace.
 
 process.on("uncaughtException", (err) => {
+  if (err && STDIO_ERROR_CODES.has(err.code)) {
+    onParentGone(`uncaught ${err.code}`);
+    return;
+  }
   log("error", "uncaughtException", { error: err.message, stack: err.stack });
 });
 
