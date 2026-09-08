@@ -892,6 +892,34 @@ async function pollStatus() {
  * Remove mailbox directories and heartbeat files for all inactive agents.
  * Called once at startup to prevent unbounded directory growth.
  */
+// A mailbox that still holds anything is NEVER deleted. Both loops below infer "orphan" from
+// heartbeats, and a recipient that is not a cc2cc agent (a one-way HTTP push sender, say) never
+// posts one — so its queue was rm -rf'd at EVERY session start, with the letters waiting in it.
+// Deleting the tree also erases `done/`, which is what an outside reader checks to answer
+// "does this queue have a consumer at all".
+async function mailboxIsEmpty(dir) {
+  try {
+    for (const e of await readdir(dir, { withFileTypes: true, recursive: true })) {
+      if (!e.isDirectory()) return false;
+    }
+    return true;
+  } catch {
+    return true; // gone or unreadable — nothing to protect
+  }
+}
+
+async function removeMailboxIfEmpty(mailboxPath, ctx) {
+  if (!(await mailboxIsEmpty(mailboxPath))) {
+    log("info", "mailbox KEPT: it is not empty", { ...ctx, path: mailboxPath });
+    return false;
+  }
+  try {
+    await rm(mailboxPath, { recursive: true, force: true });
+    log("info", "cleaned up stale mailbox", { ...ctx, path: mailboxPath });
+  } catch { /* already gone */ }
+  return true;
+}
+
 async function cleanupStaleMailboxes() {
   const sDir = statusDir();
   let heartbeatFiles;
@@ -927,10 +955,7 @@ async function cleanupStaleMailboxes() {
 
       // Remove mailbox directory
       const mailboxPath = join(BRIDGE_DIR, `to-${name}`);
-      try {
-        await rm(mailboxPath, { recursive: true, force: true });
-        log("info", "cleaned up stale mailbox", { agent: name, path: mailboxPath });
-      } catch { /* already gone */ }
+      await removeMailboxIfEmpty(mailboxPath, { agent: name });
 
       // Remove heartbeat file
       try {
@@ -965,8 +990,7 @@ async function cleanupStaleMailboxes() {
 
       const mailboxPath = join(BRIDGE_DIR, d);
       try {
-        await rm(mailboxPath, { recursive: true, force: true });
-        log("info", "cleaned up orphan mailbox", { dir: d });
+        if (!(await removeMailboxIfEmpty(mailboxPath, { dir: d }))) continue;
       } catch { /* skip */ }
     }
   } catch { /* bridge dir may not exist */ }
